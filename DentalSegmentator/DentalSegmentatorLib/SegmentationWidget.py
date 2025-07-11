@@ -6,6 +6,10 @@ import ctk
 import numpy as np
 import qt
 import slicer
+import trimesh
+import os
+import subprocess
+from qt import QInputDialog
 
 from .IconPath import icon, iconPath
 from .PythonDependencyChecker import PythonDependencyChecker, hasInternetConnection
@@ -567,6 +571,11 @@ class SegmentationWidget(qt.QWidget):
                     False
                 )
 
+                 # Add all STL files in the export folder to list
+                for file in os.listdir(folderPath):
+                    if file.lower().endswith(".stl"):
+                        exportedSTLPaths.append(os.path.join(folderPath, file))
+
         if selectedFormats & ExportFormat.NIFTI:
             slicer.vtkSlicerSegmentationsModuleLogic.ExportSegmentsBinaryLabelmapRepresentationToFiles(
                 folderPath,
@@ -577,6 +586,106 @@ class SegmentationWidget(qt.QWidget):
 
         if selectedFormats & ExportFormat.GLTF:
             self._exportToGLTF(segmentationNode, folderPath)
+
+        for stlPath in exportedSTLPaths:
+            self.postProcessWithTrimesh(stlPath)
+
+    def postProcessWithTrimesh(self, input_path):
+    import trimesh
+    import numpy as np
+    import os
+    import subprocess
+
+    # Ask the user if upper or lower tooth
+    import qt
+    tooth_type, ok = qt.QInputDialog.getText(
+        None, "Tooth Type", "Is this an upper or lower tooth? (Enter 'upper' or 'lower')"
+    )
+    if not ok or tooth_type.strip().lower() not in ['upper', 'lower']:
+        slicer.util.errorDisplay("Invalid tooth type entered. Skipping post-processing.")
+        return
+
+    tooth_type = tooth_type.strip().lower()
+
+    try:
+        tooth_mesh = trimesh.load(input_path)
+        z_min, z_max = tooth_mesh.bounds[:, 2]
+        tooth_center = tooth_mesh.bounds.mean(axis=0)
+
+        stick_length = 20.0
+        stick_radius = 2
+        stick = trimesh.creation.cylinder(radius=stick_radius, height=stick_length, sections=32)
+
+        stick_center_z = z_min - stick_length / 2 + 5 if tooth_type == 'upper' else z_max + stick_length / 2 - 5
+        stick.apply_translation([tooth_center[0], tooth_center[1], stick_center_z])
+
+        tooth_with_stick = trimesh.util.concatenate([tooth_mesh, stick])
+
+        output_dir = os.path.join(os.path.dirname(input_path), "trimesh_output")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # === File 1: Tooth + Stick ===
+        output1 = os.path.join(output_dir, f"stick_only_{os.path.basename(input_path)}")
+        tooth_with_stick.export(output1)
+
+        # === File 2: Tooth + Stick + Linear Root Movement ===
+        vertices2 = tooth_with_stick.vertices.copy()
+        z_min2, z_max2 = vertices2[:, 2].min(), vertices2[:, 2].max()
+        root_threshold = z_max2 - (z_max2 - z_min2) * 0.5
+        root_indices = np.where(vertices2[:, 2] >= root_threshold)[0]
+        vertices2[root_indices, 2] += 1
+        transition_indices = np.where(
+            (vertices2[:, 2] >= root_threshold - 5) & (vertices2[:, 2] < root_threshold)
+        )[0]
+        for idx in transition_indices:
+            d = (vertices2[idx, 2] - (root_threshold - 5)) / 5
+            vertices2[idx, 2] += d * 1
+        linear_moved_mesh = trimesh.Trimesh(vertices=vertices2, faces=tooth_with_stick.faces)
+        output2 = os.path.join(output_dir, f"linear_root_move_{os.path.basename(input_path)}")
+        linear_moved_mesh.export(output2)
+
+        # === File 3: Tooth + Stick + Enlarged + Moved Root (Quadratic) ===
+        vertices3 = tooth_with_stick.vertices.copy()
+        z_min3, z_max3 = vertices3[:, 2].min(), vertices3[:, 2].max()
+        root_threshold = z_min3 + (z_max3 - z_min3) * 0.75
+        if tooth_type == 'upper':
+            root_indices = np.where(vertices3[:, 2] >= root_threshold)[0]
+        else:
+            root_indices = np.where(vertices3[:, 2] <= root_threshold)[0]
+
+        root_center = vertices3[root_indices].mean(axis=0)
+        vertices3[root_indices] = root_center + (vertices3[root_indices] - root_center) * 1.1
+        if tooth_type == 'upper':
+            vertices3[root_indices, 2] += 1
+        else:
+            vertices3[root_indices, 2] -= 1
+
+        transition_range = 10
+        transition_indices = np.where(
+            (vertices3[:, 2] >= root_threshold - transition_range) & (vertices3[:, 2] < root_threshold)
+        )[0]
+
+        for idx in transition_indices:
+            d = (vertices3[idx, 2] - (root_threshold - transition_range)) / transition_range
+            weight = d**2
+            vertices3[idx] = (1 - weight) * vertices3[idx] + weight * (
+                root_center + (vertices3[idx] - root_center) * 1.1
+            )
+            if tooth_type == 'upper':
+                vertices3[idx, 2] += weight * 1
+            else:
+                vertices3[idx, 2] -= weight * 1
+
+        final_mesh = trimesh.Trimesh(vertices=vertices3, faces=tooth_with_stick.faces)
+        output3 = os.path.join(output_dir, f"quadratic_root_edit_{os.path.basename(input_path)}")
+        final_mesh.export(output3)
+
+        # Open output folder
+        subprocess.Popen(f'explorer "{output_dir}"')
+
+        print(f"[Trimesh] Post-processing complete for: {input_path}")
+    except Exception as e:
+        slicer.util.errorDisplay(f"Trimesh processing failed: {str(e)}")
 
     def _exportToGLTF(self, segmentationNode, folderPath, tryInstall=True):
         """
