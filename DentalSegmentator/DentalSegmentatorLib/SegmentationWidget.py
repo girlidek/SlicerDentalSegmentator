@@ -591,10 +591,6 @@ class SegmentationWidget(qt.QWidget):
             self.postProcessWithTrimesh(stlPath)
 
     def postProcessWithTrimesh(self, input_path):
-    import trimesh
-    import numpy as np
-    import os
-    import subprocess
 
     # Ask the user if upper or lower tooth
     import qt
